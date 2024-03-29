@@ -1,0 +1,1 @@
+savedcmd_/home/hao/github/markdown/ipc/eventfd/module_c/Module.symvers :=  scripts/mod/modpost -m -a      -o /home/hao/github/markdown/ipc/eventfd/module_c/Module.symvers -T /home/hao/github/markdown/ipc/eventfd/module_c/modules.order -i Module.symvers -e 

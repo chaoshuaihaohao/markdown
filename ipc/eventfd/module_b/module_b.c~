@@ -1,0 +1,255 @@
+#include <linux/module.h>	/* Needed by all modules */
+#include <linux/kernel.h>	/* Needed for KERN_ALERT */
+#include <linux/init.h>		/*Needed for __init */
+#include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/eventfd.h>
+#include <linux/kthread.h>
+#include <linux/skbuff.h>
+#include <linux/file.h>
+#include <linux/if_tun.h>
+#include <linux/poll.h>
+#include "../common.h"
+
+typedef void (*vhost_test_work_fn_t)(void);
+
+static struct socket *sock = NULL;
+
+struct vhost_test_dev {
+	struct llist_head work_list;
+	wait_queue_head_t wait;
+};
+
+/* Poll a file (eventfd or socket) */
+/* Note: there's nothing vhost_test specific about this structure. */
+struct vhost_test_poll {
+	poll_table table;
+	wait_queue_head_t *wqh;
+	wait_queue_entry_t wait;
+	__poll_t mask;
+	struct vhost_test_dev *dev;
+};
+
+static int push_count2skb(__u64 *buf)
+{
+	// 在这里执行线程的任务
+	printk(KERN_INFO "%s: count = %llu!\n", __func__, *buf);
+	struct msghdr msg = {
+		.msg_name = NULL,
+		.msg_namelen = 0,
+		.msg_control = NULL,	/* FIXME: get and handle RX aux data. */
+		.msg_controllen = 0,
+		.msg_flags = MSG_DONTWAIT,
+	};
+
+	msg.msg_control = buf;
+	if (sock)
+		sock->ops->recvmsg(sock, &msg, sizeof(*buf), MSG_DONTWAIT | MSG_TRUNC);
+	else
+		printk(KERN_ERR "Err sock is NULL!\n");
+	return 0;
+}
+
+static void handle_tx(void)
+{
+	printk(KERN_INFO "%s\n", __func__);
+
+	__u64 count = 10;
+	push_count2skb(&count);
+}
+
+static int vhost_test_poll_wakeup(wait_queue_entry_t *wait, unsigned mode,
+				  int sync, void *key)
+{
+	struct vhost_test_poll *poll =
+	    container_of(wait, struct vhost_test_poll, wait);
+
+	if (!(key_to_poll(key) & poll->mask))
+		return 0;
+
+	//work func
+	handle_tx();
+
+	return 0;
+}
+
+void vhost_test_poll_stop(struct vhost_test_poll *poll)
+{
+	if (poll->wqh) {
+		remove_wait_queue(poll->wqh, &poll->wait);
+		poll->wqh = NULL;
+	}
+}
+
+static int vhost_test_poll_start(struct vhost_test_poll *poll,
+				 struct file *file)
+{
+	__poll_t mask;
+
+	if (poll->wqh)
+		return 0;
+
+	/* 调用eventfd的poll函数，将table添加*/
+	mask = vfs_poll(file, &poll->table);
+	if (mask) {
+		vhost_test_poll_wakeup(&poll->wait, 0, 0, poll_to_key(mask));
+	}
+	if (mask & EPOLLERR) {
+		vhost_test_poll_stop(poll);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void vhost_test_poll_func(struct file *file, wait_queue_head_t *wqh,
+				 poll_table *pt)
+{
+	struct vhost_test_poll *poll;
+
+	poll = container_of(pt, struct vhost_test_poll, table);
+	poll->wqh = wqh;
+	add_wait_queue(wqh, &poll->wait);
+}
+
+void vhost_test_poll_init(struct vhost_test_poll *poll, __poll_t mask /*, struct vhost_test_dev *dev */ )
+{
+	init_waitqueue_func_entry(&poll->wait, vhost_test_poll_wakeup);
+	init_poll_funcptr(&poll->table, vhost_test_poll_func);
+	poll->mask = mask;
+//        poll->dev = dev;
+	poll->wqh = NULL;
+
+	//vhost_test_work_init(&poll->work, fn);
+}
+
+static struct vhost_test_poll poll;
+static int vhost_test_open(struct inode *inode, struct file *file)
+{
+	// 打开设备时的处理逻辑  
+	printk(KERN_INFO "%s\n", __func__);
+
+//	vhost_test_poll_init(&poll, EPOLLOUT);
+	vhost_test_poll_init(&poll, 0);
+	return 0;
+}
+
+static int vhost_test_release(struct inode *inode, struct file *file)
+{
+	// 关闭设备时的处理逻辑  
+	int ret = 0;
+
+	return ret;
+}
+
+static struct socket *get_tap_socket(int fd)
+{
+	struct file *file = fget(fd);
+	struct socket *sock;
+
+	if (!file)
+		return ERR_PTR(-EBADF);
+
+	sock = tun_get_socket(file);
+	if (!IS_ERR(sock))
+		return sock;
+
+	return sock;
+}
+
+static long vhost_test_ioctl(struct file *filp, unsigned int ioctl,
+			     unsigned long arg)
+{
+	long r = -EINVAL;
+	void __user *argp = (void __user *)arg;
+	bool kick = false; 
+	int kickfd;
+	struct file *kick_fp;
+
+	switch (ioctl) {
+	case B_SET_KICKFD:{
+			if (copy_from_user(&kickfd, argp, sizeof(kickfd)))
+				goto out;
+			/* Get eventfd struct by efd */
+			printk(KERN_INFO "B_SET_KICKFD\n");
+			kick = true;
+			r = 0;
+			break;
+	}
+	case B_SET_TUN_FD:
+			int tun_fd;
+			if (copy_from_user(&tun_fd, argp, sizeof(tun_fd)))
+				goto out;
+			sock = get_tap_socket(tun_fd);
+			if (!sock)
+				goto out;
+			r = 0;
+			printk(KERN_INFO "B_SET_TUN_FD\n");
+			break;
+
+	default:
+		printk(KERN_ERR "unsupported ioctl.\n");
+	}
+
+	if (kick) {
+		kick_fp = eventfd_fget(kickfd);
+		if (IS_ERR(kick_fp)) {
+			return PTR_ERR(kick_fp);
+		}
+		vhost_test_poll_start(&poll, kick_fp);
+		kick = false;
+	}
+
+out:
+	return r;
+
+}
+
+static const struct file_operations vhost_test_fops = {
+	.owner = THIS_MODULE,
+	.open = vhost_test_open,
+	.release = vhost_test_release,
+	// 可以添加更多的操作，如read、write等  
+	.unlocked_ioctl = vhost_test_ioctl,
+	.llseek = noop_llseek,
+};
+
+static struct miscdevice vhost_test_miscdev = {
+	MISC_DYNAMIC_MINOR,	// 使用动态分配的次设备号，主设备号都是MISC_MAJOR 
+	"vhost_test",		// 设备名  
+	&vhost_test_fops	// 操作函数集  
+};
+
+static int __init vhost_test_init(void)
+{
+	int ret;
+
+	ret = misc_register(&vhost_test_miscdev);
+	if (ret) {
+		printk(KERN_ERR "Failed to register misc device\n");
+		return ret;
+	}
+
+	printk(KERN_INFO "vhost_test misc device registered\n");
+
+	/* 尝试加载依赖的模块 */
+	ret = request_module("tun");
+	if (ret < 0) {
+		printk(KERN_ERR "Failed to load dependent module tun\n");
+		return ret;
+	}
+	return 0;
+}
+
+static void __exit vhost_test_exit(void)
+{
+	misc_deregister(&vhost_test_miscdev);
+	printk(KERN_INFO "vhost_test misc device deregistered\n");
+}
+
+module_init(vhost_test_init);
+module_exit(vhost_test_exit);
+
+MODULE_AUTHOR("Hao Chen <947481900@qq.com>");
+MODULE_DESCRIPTION("ko templete");
+MODULE_LICENSE("GPL v2");

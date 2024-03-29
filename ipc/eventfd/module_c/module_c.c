@@ -1,0 +1,124 @@
+#include <linux/module.h>/* Needed by all modules */
+#include <linux/kernel.h>/* Needed for KERN_ALERT */
+#include <linux/init.h>/*Needed for __init */
+#include <linux/fs.h>  
+#include <linux/miscdevice.h>  
+#include <linux/eventfd.h>  
+#include "../common.h"
+  
+#if 0
+static int kvm_test_open(struct inode *inode, struct file *file)  
+{  
+    // 打开设备时的处理逻辑  
+    return 0;  
+}  
+  
+static int kvm_test_release(struct inode *inode, struct file *file)  
+{  
+    // 关闭设备时的处理逻辑  
+    return 0;  
+}  
+#endif
+
+static struct eventfd_ctx *eventfd = NULL;
+
+static int assign_eventfd(int fd)
+{
+	eventfd = eventfd_ctx_fdget(fd);
+	if (IS_ERR(eventfd))
+		return PTR_ERR(eventfd);
+
+	return 0;
+}
+
+
+
+static long kvm_test_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
+{
+	long r = -EINVAL;
+	void __user *argp = (void __user *)arg;
+
+	switch(ioctl) {
+	case C_SET_KICKFD: {
+		int efd;
+		if (copy_from_user(&efd, argp, sizeof(efd)))
+			goto out;
+		/* Get eventfd struct by efd */
+		r = assign_eventfd(efd);
+		printk(KERN_INFO "C_SET_KICKFD\n");
+		break;
+	}
+	case C_WR_EVENTFD: {
+		int value;
+		if (copy_from_user(&value, argp, sizeof(value)))
+			goto out;
+		/* Get eventfd struct by b_fd */
+		eventfd_signal(eventfd, 5);
+		r = 0;
+		printk(KERN_INFO "C_WR_EVENTFD\n");
+		break;
+	}
+	case C_NOTIFY: {
+		int notify;
+		if (copy_from_user(&notify, argp, sizeof(notify)))
+			goto out;
+		if (notify == 10) {
+			eventfd_signal(eventfd, 5);
+			printk(KERN_INFO "NOTIFY\n");
+		}
+		printk(KERN_INFO "C_NOTIFY\n");
+
+		r = 0;
+		break;
+		
+	}
+	default:
+		printk(KERN_ERR "unsupported ioctl.\n");
+	}
+
+out:
+	return r;
+
+
+}  
+
+static const struct file_operations kvm_test_fops = {  
+	.owner = THIS_MODULE,  
+	//    .open = kvm_test_open,  
+	//    .release = kvm_test_release,  
+	// 可以添加更多的操作，如read、write等  
+	.unlocked_ioctl = kvm_test_ioctl,
+	.llseek = noop_llseek,
+};  
+  
+static struct miscdevice kvm_test_miscdev = {  
+    MISC_DYNAMIC_MINOR,    // 使用动态分配的次设备号，主设备号都是MISC_MAJOR 
+    "kvm_test",        // 设备名  
+    &kvm_test_fops     // 操作函数集  
+};  
+  
+static int __init kvm_test_init(void)  
+{  
+    int ret;  
+  
+    ret = misc_register(&kvm_test_miscdev);  
+    if (ret) {  
+        printk(KERN_ERR "Failed to register misc device\n");  
+        return ret;  
+    }  
+  
+    printk(KERN_INFO "kvm_test misc device registered\n");  
+    return 0;  
+}  
+  
+static void __exit kvm_test_exit(void)  
+{  
+    misc_deregister(&kvm_test_miscdev);  
+    printk(KERN_INFO "kvm_test misc device deregistered\n");  
+}  
+module_init(kvm_test_init);
+module_exit(kvm_test_exit);
+  
+MODULE_AUTHOR("Hao Chen <947481900@qq.com>");
+MODULE_DESCRIPTION("ko templete");
+MODULE_LICENSE("GPL v2");

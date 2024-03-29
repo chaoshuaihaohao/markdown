@@ -1,0 +1,1 @@
+savedcmd_/home/hao/github/markdown/ipc/eventfd/module_b/module_b.mod := printf '%s\n'   module_b.o | awk '!x[$$0]++ { print("/home/hao/github/markdown/ipc/eventfd/module_b/"$$0) }' > /home/hao/github/markdown/ipc/eventfd/module_b/module_b.mod
